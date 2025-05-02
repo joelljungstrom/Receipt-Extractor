@@ -5,6 +5,7 @@ import numpy as np
 import hashlib
 import glob
 import os
+import csv
 from datetime import datetime
 
 
@@ -17,6 +18,12 @@ def generate_article_number(article_name, unit_price):
 
     return article_number
 
+# function for extracting purchase id
+def extract_receipt_code(text):
+    all_numbers = re.findall(r'\d+', text)
+    purchase_id = all_numbers[-1] if all_numbers else None
+    return purchase_id
+
 # function for identifying and creating purchase timestamp
 def extract_date_and_time(text):    
     date_match = re.search(r'(?<=Datum\s)(\d{4}-\d{2}-\d{2})', text)
@@ -28,20 +35,29 @@ def extract_date_and_time(text):
     full_timestamp = f"{date} {time}"
     return datetime.strptime(full_timestamp, "%Y-%m-%d %H:%M")
 
+# function for saving output as a CSV
+def save_df_to_csv(df):
+    output_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Output/article_purchase_data.csv'
+    df.to_csv(output_path, index=False, encoding='utf-8')
+
 # function for extracting line items from PDF
 def extract_line_items_from_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
         all_text = ''
         for page in pdf.pages:
-            all_text += page.extract_text()
+            page_text = page.extract_text() or ''
+            all_text += page_text + '\n'
 
     start_word = "Summa(SEK)"
     if re.search(r"(?i)\bAvstämning\b", all_text):
         end_word = "Avstämning"
+    elif re.search(r"(?i)\bFelaktig\b", all_text):
+        end_word = "Felaktig"
     else:
         end_word = "Betalat"
 
     purchase_timestamp = extract_date_and_time(all_text)
+    purchase_id = extract_receipt_code(all_text)
 
     pattern = re.compile(r'{}(.*?){}'.format(re.escape(start_word), re.escape(end_word)), re.DOTALL)
     matches = pattern.findall(all_text)
@@ -50,9 +66,11 @@ def extract_line_items_from_pdf(pdf_path):
     for match in matches:
         lines = match.strip().split("\n")
         for line in lines:
+            columns = None
+
             # Identify regular line items where article numbers are present (a minimum 7-digit long string)
-            if re.search(r'\d{8,}', line):
-                columns = re.split(r'(\d{7,})', line)
+            if re.search(r'\d{4,}', line):
+                columns = re.split(r'(\d{4,})', line)
                 columns = [col.strip() for col in columns if col.strip()]
                 
                 if len(columns) > 1:
@@ -90,27 +108,52 @@ def extract_line_items_from_pdf(pdf_path):
                         line[match.start(0):match.end(0)].strip() # article_total
                     ]
 
-            #print(f"Original line: {line}")
-            #print(f"Splitted columns: {columns}")
+            if columns is None:
+                continue
 
-            # replace missing article_numbers with an aritificial article number
             if len(columns) > 1:
                 if columns[1] is None:
                     article_number = generate_article_number(columns[0], columns[2])
                     columns[1] = article_number
-            
+
+            # append timestamp and purchase id
             columns.append(purchase_timestamp)
+            columns.append(purchase_id)
 
             line_items.append(columns)
             
-    line_items_df = pd.DataFrame(line_items, columns=["article_name", "article_number", "unit_price", "amount", "unit_measurement", "article_total", "purchase_timestamp"])
+    expected_cols = 8
+    for idx, cols in enumerate(line_items):
+        if len(cols) != expected_cols:
+            print(f"[ERROR] PDF: {pdf_path}, line item {idx} has {len(cols)} columns: {cols}")
+
+    line_items_df = pd.DataFrame(line_items, columns=[
+            "article_name", 
+            "article_number", 
+            "unit_price", 
+            "amount", 
+            "unit_measurement", 
+            "article_total", 
+            "purchase_timestamp",
+            "purchase_id"
+        ]
+    )
+
+    def safe_to_float(val, col_name):
+        try:
+            if isinstance(val, str):
+                return float(val.replace(',', '.'))
+            return val
+        except Exception:
+            print(f"[ERROR] PDF: {pdf_path}, conversion failed in column '{col_name}' with value: {val!r}")
+            raise
 
     line_items_df['article_name'] = line_items_df['article_name'].astype(str)
     line_items_df['article_number'] = line_items_df['article_number'].fillna(np.nan).astype(str)
-    line_items_df['unit_price'] = line_items_df['unit_price'].apply(lambda x: float(x.replace(',', '.')) if isinstance(x, str) else x)
-    line_items_df['amount'] = line_items_df['amount'].apply(lambda x: float(x.replace(',', '.')) if isinstance(x, str) else x)
+    line_items_df['unit_price'] = line_items_df['unit_price'].apply(lambda x: safe_to_float(x, 'unit_price'))
+    line_items_df['amount'] = line_items_df['amount'].apply(lambda x: safe_to_float(x, 'amount'))
     line_items_df['unit_measurement'] = line_items_df['unit_measurement'].astype(str)
-    line_items_df['article_total'] = line_items_df['article_total'].apply(lambda x: float(x.replace(',', '.')) if isinstance(x, str) else x)
+    line_items_df['article_total'] = line_items_df['article_total'].apply(lambda x: safe_to_float(x, 'article_total'))
 
     return line_items_df
 
@@ -126,11 +169,11 @@ def purchase_history(folder_path):
 
     combined_line_items = pd.concat(all_line_items, ignore_index=True)
     
-    pdf_names = [os.path.basename(path) for path in pdf_paths]
-    repeated_pdf_names = [pdf_name for pdf_name in pdf_names for _ in range(len(all_line_items[0]))]
+    #pdf_names = [os.path.basename(path) for path in pdf_paths]
+    #repeated_pdf_names = [pdf_name for pdf_name in pdf_names for _ in range(len(all_line_items[0]))]
 
-    combined_line_items['source_name'] = repeated_pdf_names[:len(combined_line_items)]
-    
+    #combined_line_items['source_name'] = repeated_pdf_names[:len(combined_line_items)]
+    save_df_to_csv(combined_line_items)
     return combined_line_items
 
 # function for storing unique articles
@@ -138,10 +181,14 @@ def unique_articles(line_items_df, article_name, article_number):
     article_pairs = line_items_df[[article_name, article_number]].drop_duplicates()
     return article_pairs
 
-#pdf_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts/Maxi ICA Stormarknad Lindhagen 2025-03-22.pdf'
-folder_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts/tmp'
-#line_items_df = extract_line_items_from_pdf(pdf_path)
+# paths for pdfs
+pdf_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts/tmp/Maxi ICA Stormarknad Lindhagen 2025-04-26.pdf'
+folder_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts'
 
+# run 1 file
+line_items_df = extract_line_items_from_pdf(pdf_path)
+#print(line_items_df)
+
+# run multiple files
 combined_data = purchase_history(folder_path)
-
 print(combined_data)

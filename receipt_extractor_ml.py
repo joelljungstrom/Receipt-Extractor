@@ -4,7 +4,7 @@ import pandas as pd
 import csv 
 from datetime import datetime 
 
-def extract_purchase_details(text):
+def extract_date_and_time(text):
     date_match = re.search(r'(?<=Datum\s)(\d{4}-\d{2}-\d{2})', text)
     time_match = re.search(r'(?<=Tid\s)(\d{2}:\d{2})', text)
     
@@ -14,9 +14,12 @@ def extract_purchase_details(text):
     full_timestamp = f"{date} {time}"
     full_timestamp = datetime.strptime(full_timestamp, "%Y-%m-%d %H:%M")
 
-    receipt_id = re.search(r'')
+    return full_timestamp
 
-    return datetime.strptime(full_timestamp, "%Y-%m-%d %H:%M")
+def extract_receipt_code(text):
+    all_numbers = re.findall(r'\d+', text)
+    purchase_id = all_numbers[-1] if all_numbers else None
+    return purchase_id
 
 def extract_line_items_from_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
@@ -26,9 +29,10 @@ def extract_line_items_from_pdf(pdf_path):
         for page in pdf.pages:
             all_text += page.extract_text()
         
-        purchase_timestamp = extract_purchase_details(all_text)
+        purchase_timestamp = extract_date_and_time(all_text)
+        purchase_id = extract_receipt_code(all_text)
     
-    return all_text, purchase_timestamp
+    return all_text, purchase_timestamp, purchase_id
 
 def save_text_to_csv(text, output_csv):
     lines = text.split('\n')
