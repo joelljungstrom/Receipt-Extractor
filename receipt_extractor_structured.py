@@ -8,6 +8,15 @@ import os
 import csv
 from datetime import datetime
 
+# check if string can be converted to number and return failed instance if ther is one
+def safe_to_float(val, col_name):
+        try:
+            if isinstance(val, str):
+                return float(val.replace(',', '.'))
+            return val
+        except Exception:
+            print(f"[ERROR] PDF: {pdf_path}, conversion failed in column '{col_name}' with value: {val!r}")
+            raise
 
 # function for generating artificial article number
 def generate_article_number(article_name, unit_price):
@@ -19,48 +28,86 @@ def generate_article_number(article_name, unit_price):
     return article_number
 
 # function for extracting purchase id
-def extract_receipt_code(text):
-    all_numbers = re.findall(r'\d+', text)
+def extract_receipt_code(receipt):
+    all_numbers = re.findall(r'\d+', receipt)
     purchase_id = all_numbers[-1] if all_numbers else None
+    
     return purchase_id
 
 # function for identifying and creating purchase timestamp
-def extract_date_and_time(text):    
-    date_match = re.search(r'(?<=Datum\s)(\d{4}-\d{2}-\d{2})', text)
-    time_match = re.search(r'(?<=Tid\s)(\d{2}:\d{2})', text)
+def extract_date_and_time(receipt):    
+    date_match = re.search(r'(?<=Datum\s)(\d{4}-\d{2}-\d{2})', receipt)
+    time_match = re.search(r'(?<=Tid\s)(\d{2}:\d{2})', receipt)
     
     date = date_match.group(0) if date_match else None
     time = time_match.group(0) if time_match else None
     
     full_timestamp = f"{date} {time}"
-    return datetime.strptime(full_timestamp, "%Y-%m-%d %H:%M")
+    purchase_timestamp = datetime.strptime(full_timestamp, "%Y-%m-%d %H:%M")
+    
+    return purchase_timestamp
+
+# function for extracting store name
+def extract_store_name(receipt):
+    lines = [line.strip() for line in receipt.splitlines() if line.strip()]
+    store_name = lines[1] if len(lines) > 1 else None
+    
+    return store_name
+
+# function for extracting taxes
+def extract_taxes(receipt):
+    lines = [line.strip() for line in receipt.splitlines() if line.strip()]
+    taxes = re.search(r"Moms\s*%\s+Moms\s+Netto\s+Brutto", receipt)
+    if not taxes:
+        tax = 0.0
+        net = 0.0
+        gross = 0.0
+    
+    else: 
+        block = receipt[taxes.end():]
+        lines = re.findall(r"^(\d+,\d{2})\s+(\d+,\d{2})\s+(\d+,\d{2})\s+(\d+,\d{2})",
+                        block, flags=re.MULTILINE)
+
+        tax = sum(float(t.replace(',', '.')) for _, t, _, _ in lines)
+        net = sum(float(n.replace(',', '.')) for _, _, n, _ in lines)
+        gross = sum(float(g.replace(',', '.')) for _, _, _, g in lines)
+    
+    return tax, net, gross
 
 # function for saving output as a CSV
-def save_df_to_csv(df):
-    output_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Output/article_purchase_data.csv'
+def save_df_to_csv(df, file_name):
+    output_path = f'/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Output/{file_name}.csv'
     df.to_csv(output_path, index=False, encoding='utf-8')
 
-# function for extracting line items from PDF
-def extract_line_items_from_pdf(pdf_path):
+# function for extracting text from PDF
+def extract_text_from_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
-        all_text = ''
+        receipt = ''
         for page in pdf.pages:
             page_text = page.extract_text() or ''
-            all_text += page_text + '\n'
+            receipt += page_text + '\n'
+    
+    return receipt
+
+# function for extracting line items from PDF
+def extract_line_items(pdf_path):
+    
+    receipt = extract_text_from_pdf(pdf_path)
 
     start_word = "Summa(SEK)"
-    if re.search(r"(?i)\bAvstämning\b", all_text):
+    if re.search(r"(?i)\bAvstämning\b", receipt):
         end_word = "Avstämning"
-    elif re.search(r"(?i)\bFelaktig\b", all_text):
+    elif re.search(r"(?i)\bFelaktig\b", receipt):
         end_word = "Felaktig"
     else:
         end_word = "Betalat"
 
-    purchase_timestamp = extract_date_and_time(all_text)
-    purchase_id = extract_receipt_code(all_text)
+    purchase_timestamp = extract_date_and_time(receipt)
+    purchase_id = extract_receipt_code(receipt)
+    store_name = extract_store_name(receipt)
 
     pattern = re.compile(r'{}(.*?){}'.format(re.escape(start_word), re.escape(end_word)), re.DOTALL)
-    matches = pattern.findall(all_text)
+    matches = pattern.findall(receipt)
     
     line_items = []
     for match in matches:
@@ -86,7 +133,7 @@ def extract_line_items_from_pdf(pdf_path):
                     article_total = match.group(3)
                     columns = [
                         "Pant", # article_name
-                        None,  # article_number
+                        None,  # article_id
                         unit_price,  # unit_price
                         amount,  # amount
                         "st",  # unit_measurement
@@ -101,7 +148,7 @@ def extract_line_items_from_pdf(pdf_path):
                 if match:
                     columns = [
                         line[:match.start(0)].strip(),  # article_name
-                        None, # article_number
+                        None, # article_id
                         line[match.start(0):match.end(0)].strip(), # unit_price
                         "1,00",  # amount
                         "st",  # unit_measurement
@@ -119,62 +166,120 @@ def extract_line_items_from_pdf(pdf_path):
             # append timestamp and purchase id
             columns.append(purchase_timestamp)
             columns.append(purchase_id)
+            columns.append(store_name)
 
             line_items.append(columns)
             
-    expected_cols = 8
+    expected_cols = 9
     for idx, cols in enumerate(line_items):
         if len(cols) != expected_cols:
             print(f"[ERROR] PDF: {pdf_path}, line item {idx} has {len(cols)} columns: {cols}")
 
     line_items_df = pd.DataFrame(line_items, columns=[
             "article_name", 
-            "article_number", 
+            "article_id", 
             "unit_price", 
             "amount", 
             "unit_measurement", 
-            "article_total", 
+            "total", 
             "purchase_timestamp",
-            "purchase_id"
+            "purchase_id",
+            "store_name"
         ]
     )
 
-    def safe_to_float(val, col_name):
-        try:
-            if isinstance(val, str):
-                return float(val.replace(',', '.'))
-            return val
-        except Exception:
-            print(f"[ERROR] PDF: {pdf_path}, conversion failed in column '{col_name}' with value: {val!r}")
-            raise
-
-    line_items_df['article_name'] = line_items_df['article_name'].astype(str)
-    line_items_df['article_number'] = line_items_df['article_number'].fillna(np.nan).astype(str)
-    line_items_df['unit_price'] = line_items_df['unit_price'].apply(lambda x: safe_to_float(x, 'unit_price'))
-    line_items_df['amount'] = line_items_df['amount'].apply(lambda x: safe_to_float(x, 'amount'))
-    line_items_df['unit_measurement'] = line_items_df['unit_measurement'].astype(str)
-    line_items_df['article_total'] = line_items_df['article_total'].apply(lambda x: safe_to_float(x, 'article_total'))
+    for col in ["unit_price", "amount", "total"]:
+        line_items_df[col] = line_items_df[col].apply(lambda x: safe_to_float(x, col))
+    for col in ["article_name", "article_id", "unit_measurement"]:
+        line_items_df[col] = line_items_df[col].astype(str)
 
     return line_items_df
+
+# function for extracting shop instances from PDF
+def extract_purchase_information(pdf_path):
+    
+    receipt = extract_text_from_pdf(pdf_path)
+
+    purchase_timestamp = extract_date_and_time(receipt)
+    purchase_id = extract_receipt_code(receipt)
+    store_name = extract_store_name(receipt)
+    tax, net, gross = extract_taxes(receipt)
+
+    start_word = "Betalat"
+    end_word = "Betalningsinformation"
+
+    pattern = re.compile(r'{}(.*?){}'.format(re.escape(start_word), re.escape(end_word)), re.DOTALL)
+    matches = pattern.findall(receipt)
+    
+    purchase_instances = []
+    for match in matches:
+        # extract purchase total
+        receipt_total = re.search(r'(\d+,\d{2})', match)
+        purchase_total = receipt_total.group(1) if receipt_total else "0,00"
+
+        # extract purchase discount
+        disc = re.search(r'(?i)Erhållen rabatt\s+(-?\d+,\d{2})', match)
+        discount = disc.group(1) if disc else "0,00"
+
+        # extract rounding
+        receipt_rounding = re.search(r'(?i)Avrundning\s+(-?\d+,\d{2})', match)
+        rounding = receipt_rounding.group(1) if receipt_rounding else "0,00"
+
+        purchase_instances.append([
+            purchase_id,
+            purchase_timestamp,
+            store_name,
+            purchase_total,
+            tax,
+            net,
+            gross,
+            discount,
+            rounding,
+            "SEK"
+        ])
+
+    purchase_instances_df = pd.DataFrame(
+        purchase_instances,
+        columns=[
+            "id",
+            "timestamp",
+            "store_name",
+            "total",
+            "tax",
+            "net",
+            "gross",
+            "discount",
+            "rounding",
+            "currency"
+        ]
+    )
+
+    for col in ["total", "tax", "net", "gross", "discount", "rounding"]:
+        purchase_instances_df[col] = purchase_instances_df[col].apply(lambda x: safe_to_float(x, col))
+
+    return purchase_instances_df
 
 # function for extracting line items from multiple PDFs
 def purchase_history(folder_path):
     pdf_paths = glob.glob(os.path.join(folder_path, "*.pdf"))
 
-    all_line_items = []
+    line_items = []
+    purchase_instances = []
     
     for pdf_path in pdf_paths:
-        line_items_df = extract_line_items_from_pdf(pdf_path)
-        all_line_items.append(line_items_df)
+        line_items_df = extract_line_items(pdf_path)
+        line_items.append(line_items_df)
 
-    combined_line_items = pd.concat(all_line_items, ignore_index=True)
-    
-    #pdf_names = [os.path.basename(path) for path in pdf_paths]
-    #repeated_pdf_names = [pdf_name for pdf_name in pdf_names for _ in range(len(all_line_items[0]))]
+        purchase_instances_df = extract_purchase_information(pdf_path)
+        purchase_instances.append(purchase_instances_df)
 
-    #combined_line_items['source_name'] = repeated_pdf_names[:len(combined_line_items)]
-    save_df_to_csv(combined_line_items)
-    return combined_line_items
+    combined_line_items = pd.concat(line_items, ignore_index=True)
+    combined_purchase_instances = pd.concat(purchase_instances, ignore_index=True)
+
+    save_df_to_csv(combined_line_items, "line_items")
+    save_df_to_csv(combined_purchase_instances, "purchases")
+
+    return combined_line_items, combined_purchase_instances
 
 # function for storing unique articles
 def unique_articles(line_items_df, article_name, article_number):
@@ -182,11 +287,11 @@ def unique_articles(line_items_df, article_name, article_number):
     return article_pairs
 
 # paths for pdfs
-pdf_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts/tmp/Maxi ICA Stormarknad Lindhagen 2025-04-26.pdf'
+pdf_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts/Maxi ICA Stormarknad Lindhagen 2025-04-26.pdf'
 folder_path = '/Users/joel.ljungstroem/Documents/Projects/Receipt Extractor/Receipts'
 
 # run 1 file
-line_items_df = extract_line_items_from_pdf(pdf_path)
+line_items_df = extract_line_items(pdf_path)
 #print(line_items_df)
 
 # run multiple files
