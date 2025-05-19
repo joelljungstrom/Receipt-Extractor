@@ -242,7 +242,7 @@ def extract_purchase_information(pdf_path):
         purchase_instances,
         columns=[
             "id",
-            "timestamp",
+            "purchase_timestamp",
             "store_name",
             "total",
             "tax",
